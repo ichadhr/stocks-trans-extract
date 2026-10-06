@@ -49,18 +49,16 @@ def print_txn_table(txns) -> None:
         print("    (no rows)")
         return
     header = (
-        f"    {'SYMBOL':<7}| {'ACCOUNT':<10}| {'ACTION':<8}| {'DETAILS':>8} | {'QTY':<6}|"
+        f"    {'SYMBOL':<7}| {'ACCOUNT':<10}| {'ACTION':<8}| {'DETAILS':<11}| {'QTY':<6}|"
         f" {'FILL':>8} | STATUS"
     )
     print(header)
     print("    " + "-" * (len(header) - 4))
     for t in txns:
         fill = "-" if t.fill_price is None else f"{t.fill_price:g}"
-        details_val = getattr(t, "details", None)
-        if details_val is None:
-            details_val = getattr(t, "price", 0.0)
+        details_val = str(getattr(t, "details", "")).strip() or (f"{t.price:g}" if t.price else "-")
         print(
-            f"    {t.symbol:<7}| {t.account:<10}| {t.action:<8}| {details_val:>8g} | {t.quantity:<6}|"
+            f"    {t.symbol:<7}| {t.account:<10}| {t.action:<8}| {details_val:<11}| {t.quantity:<6}|"
             f" {fill:>8} | {t.status}"
         )
 

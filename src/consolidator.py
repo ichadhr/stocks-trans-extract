@@ -28,13 +28,13 @@ class MasterLedger:
     def process_transactions(self, transactions: Sequence[Transaction]) -> None:
         """Process a list of transactions (assumed to be ordered chronologically)."""
         for txn in transactions:
-            key = (txn.us_trade_date, txn.account, txn.symbol, txn.action, txn.price)
+            details_val = str(getattr(txn, "details", "")).strip()
+            if not details_val:
+                details_val = f"{txn.price:g}" if txn.price else ""
+            key = (txn.us_trade_date, txn.account, txn.symbol, txn.action, details_val)
 
             if key not in self._records:
                 # New order entry
-                details_val = getattr(txn, "details", None)
-                if details_val is None:
-                    details_val = txn.price
                 self._records[key] = {
                     "us_trade_date": txn.us_trade_date,
                     "account": txn.account,

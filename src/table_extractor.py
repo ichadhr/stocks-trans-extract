@@ -21,7 +21,7 @@ def get_ocr_engine() -> RapidOCR:
 DEFAULT_TABLE_CROP = (26, 116, 780, 638)
 
 ACCOUNT_REGEX = re.compile(r"U\d{8}")
-LMT_PRICE_REGEX = re.compile(r"(?:LMT|MID|Cap)?\s*(\d+\.\d+)")
+LMT_PRICE_REGEX = re.compile(r"(?:LMT|MID|Cap|STP)?\s*(\d+\.\d+)")
 PRICE_NUMBER_REGEX = re.compile(r"(\d+\.\d+)")
 QTY_REGEX = re.compile(r"^(\d+/\d+|\d+)$")
 SYMBOL_REGEX = re.compile(r"\b([A-Z]{1,5})\b")
@@ -35,23 +35,25 @@ class Transaction:
     symbol: str
     action: str          # BUY or SELL
     quantity: str        # e.g. "0/7", "7", "44"
-    price: float = 0.0   # Limit / order price (Details column in TWS)
+    details: str = ""    # Literal text or limit price from Details column (e.g. "1086.90", "Price Cap")
+    price: float = 0.0   # Numeric price fallback for backwards compatibility
     fill_price: float | None = None
     status: str = ""     # WORKING, PARTIAL, FILLED (informational only; derived from quantity)
     raw_text: str = ""
-    details: float | None = None
 
     def __post_init__(self):
-        if self.details is not None and (self.price == 0.0 or self.price is None):
-            self.price = float(self.details)
-        elif self.price is not None and self.details is None:
-            self.details = float(self.price)
+        if self.details is None:
+            self.details = f"{self.price:g}" if self.price else ""
+        else:
+            self.details = str(self.details).strip()
+            if (not self.price or self.price == 0.0) and self.details:
+                try:
+                    self.price = float(self.details)
+                except ValueError:
+                    self.price = self.fill_price if self.fill_price is not None else 0.0
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        if d.get("details") is None:
-            d["details"] = d.get("price")
-        return d
+        return asdict(self)
 
 
 def parse_row_boxes(items: list[tuple], image_name: str, us_trade_date: str) -> Transaction | None:
@@ -100,15 +102,15 @@ def parse_row_boxes(items: list[tuple], image_name: str, us_trade_date: str) -> 
     all_after_text = " ".join(it[2] for it in items[account_idx:])
     if "BUY" in all_after_text.upper():
         action = "BUY"
-    elif any(k in all_after_text for k in ["SELL", "S...", "S.", "MID"]):
+    elif any(k in all_after_text for k in ["SELL", "S...", "S.", "MID", "STP"]):
         action = "SELL"
     else:
         action = "UNKNOWN"
 
-    # 4. Quantity and Fill Price (right side of table, x_min > 480)
-    right_items = [it for it in items if it[0] > 480]
+    # 4. Quantity and Fill Price (right side of table, x_min > 400)
+    right_items = [it for it in items if it[0] > 400]
     quantity = None
-    fill_price = None
+    fill_candidates = []
 
     for it in right_items:
         t = it[2].strip()
@@ -119,36 +121,45 @@ def parse_row_boxes(items: list[tuple], image_name: str, us_trade_date: str) -> 
             if m_qty:
                 quantity = m_qty.group(1)
                 continue
-        if fill_price is None:
-            m_px = PRICE_NUMBER_REGEX.search(t)
-            if m_px:
-                fill_price = float(m_px.group(1))
-                continue
+        m_px = PRICE_NUMBER_REGEX.search(t)
+        if m_px:
+            fill_candidates.append(float(m_px.group(1)))
 
-    # 5. Order / Limit price (search in items starting from account)
+    # 5. Order / Limit price / Details text (search in items starting from account)
     limit_price = None
+    details_text = ""
     for it in items[account_idx:]:
+        if "Price Cap" in it[2] or "Cap" in it[2]:
+            details_text = "Price Cap"
+            break
         m_lmt = LMT_PRICE_REGEX.search(it[2])
         if m_lmt:
-            if "LMT" in it[2] or it[0] < 520:
+            if "LMT" in it[2] or "STP" in it[2] or it[0] < 520:
                 limit_price = float(m_lmt.group(1))
+                details_text = f"{limit_price:g}"
                 break
 
-    price = limit_price if limit_price is not None else fill_price
-    if price is None:
-        price = 0.0
+    if not details_text and limit_price is not None:
+        details_text = f"{limit_price:g}"
 
-    # 6. Status: derived strictly from quantity.
+    # 6. Status & Fill Price: derived strictly from quantity.
     # CRITICAL: Status is purely informational. NEVER use status as a detector or for dedup!
     if quantity:
         if "/" in quantity:
             parts = quantity.split("/")
             filled = int(parts[0])
             status = "WORKING" if filled == 0 else "PARTIAL"
+            fill_price = None if filled == 0 else (fill_candidates[-1] if fill_candidates else None)
         else:
             status = "FILLED"
+            fill_price = fill_candidates[-1] if fill_candidates else None
     else:
         status = "UNKNOWN"
+        fill_price = None
+
+    price = limit_price if limit_price is not None else fill_price
+    if price is None:
+        price = 0.0
 
     return Transaction(
         image_name=image_name,
@@ -157,11 +168,11 @@ def parse_row_boxes(items: list[tuple], image_name: str, us_trade_date: str) -> 
         symbol=symbol,
         action=action,
         quantity=quantity or "0",
+        details=details_text or (f"{price:g}" if price else ""),
         price=price,
         fill_price=fill_price,
         status=status,
         raw_text=row_text,
-        details=price,
     )
 
 

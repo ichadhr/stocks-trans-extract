@@ -32,14 +32,12 @@ class AuditedOrder(BaseModel):
         "SELL may appear as 'SELL', truncated 'S...', 'S.', or 'S', with or without a red badge. "
         "Every stock order in this table is strictly BUY or SELL."
     )
-    details: float | None = Field(
-        default=None,
-        description="Order limit price or entered price as a float (from the Details column in the image, e.g. 174.92, 548.79), "
-        "ignoring prefixes like LMT, MID, or Adapt."
-    )
-    price: float | None = Field(
-        default=None,
-        description="Limit price as a float, same as details."
+    details: str = Field(
+        default="",
+        description="The literal order parameter shown in the Details column. "
+        "For limit orders, provide the numeric limit (e.g. '1086.90', '220.43', '164.60'). "
+        "For midpoint or price cap orders, provide 'Price Cap'. "
+        "DO NOT copy the Fill Price here!"
     )
     quantity: str = Field(
         description="Order quantity string: '0/N' for working/unfilled, 'M/N' for partially filled, "
@@ -49,14 +47,6 @@ class AuditedOrder(BaseModel):
         default=None,
         description="Executed average fill price from the Fill Px column, or null if unexecuted / 0.00 / '-'."
     )
-
-    @property
-    def order_price(self) -> float:
-        if self.details is not None:
-            return self.details
-        if self.price is not None:
-            return self.price
-        return 0.0
 
 
 class AuditResult(BaseModel):
@@ -131,11 +121,14 @@ def validate_and_fill_with_gemini(
         "- Quantity:\n"
         "  * Verify the exact quantity string. Check if any digits were clipped at column dividers (e.g. '11/12' vs '11/1').\n"
         "  * Format: '0/N' for working, 'M/N' for partial, or integer 'N' for filled.\n"
-        "- Details (Limit Price) & Fill Price:\n"
-        "  * Details: numeric float from Details column, ignoring order type words like 'LMT' or 'Adapt'.\n"
-        "  * Fill Price: float from Fill Px column, or null if unexecuted (shown as '-' or '0.00').\n"
-        "  * If a value is truncated with trailing dots (e.g. '1367.….'), record the visible\n"
-        "    number as a float (e.g. 1367.0) — do NOT return null for it.\n"
+        "- Details & Fill Price:\n"
+        "  * Details: The order instruction / limit or stop parameter shown in the Details column.\n"
+        "    - If it is a limit or stop order (e.g. 'LMT 1086.90', 'STP 868.95'), record the numeric price as a string (e.g. '1086.90', '868.95').\n"
+        "    - If it shows non-numeric text like 'Price Cap N...' or 'MKT', record 'Price Cap' or 'MKT'. DO NOT put the fill price in Details!\n"
+        "  * Fill Price: float from Fill Px column (the rightmost price column; the actual execution price), or null if unexecuted (shown as '-' or '0.00').\n"
+        "    - NOTE: Columns on the right are: Quantity | Aux. Px | Fill Px. DO NOT take numbers from Aux. Px!\n"
+        "    - For WORKING orders ('0/N'), Fill Price is ALWAYS null.\n"
+        "  * If a fill price is truncated with trailing dots (e.g. '1832....', '1085....'), record the visible number (e.g. 1832.0, 1085.0).\n"
         "- Table edges (IMPORTANT):\n"
         "  * This image is a CROP of a larger TWS window. The table does NOT necessarily start or end at the image edges.\n"
         "  * A row touching the top or bottom edge may be CUT OFF: half-visible text, clipped digits, missing decimals (e.g. '77.5' shown when the real value is '77.25').\n"
@@ -146,12 +139,12 @@ def validate_and_fill_with_gemini(
         "Return the complete, corrected list of orders in visual order from top to bottom."
     )
 
-    candidate_models = [model_name, "gemini-3-flash-preview", "gemini-2.0-flash"]
+    candidate_models = [model_name, "gemini-3.8-flash", "gemini-3-flash-preview"]
     seen = set()
     candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
 
     for model in candidate_models:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -178,7 +171,22 @@ def validate_and_fill_with_gemini(
                     else:
                         status = "FILLED"
 
-                    val_details = o.order_price
+                    details_str = str(o.details or "").strip()
+                    if "Price Cap" in details_str or "Cap" in details_str:
+                        details_str = "Price Cap"
+                    elif details_str.startswith("LMT"):
+                        details_str = details_str.replace("LMT", "").strip()
+                    elif details_str.startswith("STP"):
+                        details_str = details_str.replace("STP", "").strip()
+
+                    try:
+                        numeric_px = float(details_str)
+                    except ValueError:
+                        numeric_px = o.fill_price if (o.fill_price and o.fill_price > 0) else 0.0
+
+                    # For working orders, fill_price is strictly None
+                    final_fill = None if status == "WORKING" else (o.fill_price if (o.fill_price and o.fill_price > 0) else None)
+
                     audited_transactions.append(
                         Transaction(
                             image_name=image_name,
@@ -187,20 +195,21 @@ def validate_and_fill_with_gemini(
                             symbol=o.symbol.upper(),
                             action=o.action.upper(),
                             quantity=o.quantity,
-                            price=val_details,
-                            fill_price=o.fill_price if (o.fill_price and o.fill_price > 0) else None,
+                            details=details_str,
+                            price=numeric_px,
+                            fill_price=final_fill,
                             status=status,
-                            raw_text=f"Audited: {o.symbol} | {o.account} | {o.action} | {o.quantity} @ {val_details}",
-                            details=val_details,
+                            raw_text=f"Audited: {o.symbol} | {o.account} | {o.action} | {details_str} | {o.quantity}",
                         )
                     )
                 return audited_transactions
 
             except Exception as e:
                 err_msg = str(e)
-                if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                    print(f"  [Gemini Vision] {model} busy (503). Retrying in 2s...")
-                    time.sleep(2.0)
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    sleep_time = 2.0 * (attempt + 1)
+                    print(f"  [Gemini Vision] {model} busy (attempt {attempt+1}/3). Retrying in {sleep_time:g}s...")
+                    time.sleep(sleep_time)
                 else:
                     print(f"  [Gemini Vision] {model} notice: {err_msg[:80]}...")
                     break  # Try next candidate model
