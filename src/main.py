@@ -1,6 +1,10 @@
 import os
 import shutil
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 from pathlib import Path
 
 # Ensure src directory is in sys.path

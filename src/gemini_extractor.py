@@ -60,7 +60,10 @@ def get_gemini_client() -> genai.Client | None:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(client_args={"timeout": 45.0}),
+    )
 
 
 def validate_and_fill_with_gemini(
@@ -206,9 +209,16 @@ def validate_and_fill_with_gemini(
 
             except Exception as e:
                 err_msg = str(e)
-                if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                if (
+                    "503" in err_msg
+                    or "UNAVAILABLE" in err_msg
+                    or "429" in err_msg
+                    or "RESOURCE_EXHAUSTED" in err_msg
+                    or "timeout" in err_msg.lower()
+                    or "timed out" in err_msg.lower()
+                ):
                     sleep_time = 2.0 * (attempt + 1)
-                    print(f"  [Gemini Vision] {model} busy (attempt {attempt+1}/3). Retrying in {sleep_time:g}s...")
+                    print(f"  [Gemini Vision] {model} busy/timeout (attempt {attempt+1}/3). Retrying in {sleep_time:g}s...")
                     time.sleep(sleep_time)
                 else:
                     print(f"  [Gemini Vision] {model} notice: {err_msg[:80]}...")
